@@ -1,0 +1,192 @@
+{
+  "_docs": "Sample API requests and responses for React frontend integration. Use these as reference for axios/fetch calls.",
+
+  "hiring": {
+    "endpoint": "POST /hiring/predict",
+    "description": "Predict if a job candidate should be hired",
+
+    "sample_request": {
+      "years_experience": 5,
+      "education_level": 2,
+      "technical_score": 82,
+      "communication_score": 75,
+      "num_past_jobs": 3,
+      "certifications": 2,
+      "gender": "female",
+      "religion": null,
+      "ethnicity": null
+    },
+
+    "sample_response_hired": {
+      "prediction": 1,
+      "prediction_label": "Hired",
+      "confidence": 0.87,
+      "explanation": "Hired — candidate shows strong technical score (82/100), strong communication score (75/100), 5 years of experience.",
+      "fairness": {
+        "sensitive_attribute": "gender",
+        "domain": "hiring",
+        "is_fair": true,
+        "warning": null,
+        "metrics": {
+          "demographic_parity_difference": null,
+          "equal_opportunity_difference": null,
+          "note": "Single-prediction fairness is logged. Batch metrics are computed from historical data."
+        },
+        "ethical_note": "Sensitive attributes are used ONLY to monitor fairness. They are NOT inputs to the prediction model."
+      },
+      "message": "Prediction complete."
+    },
+
+    "sample_response_rejected": {
+      "prediction": 0,
+      "prediction_label": "Not Hired",
+      "confidence": 0.23,
+      "explanation": "Not hired — low technical score (35/100), limited experience (1 years).",
+      "fairness": {
+        "sensitive_attribute": "gender",
+        "domain": "hiring",
+        "is_fair": true,
+        "warning": null,
+        "metrics": {
+          "note": "Single-prediction fairness is logged."
+        },
+        "ethical_note": "Sensitive attributes are used ONLY to monitor fairness."
+      },
+      "message": "Prediction complete."
+    },
+
+    "education_level_guide": {
+      "0": "High School",
+      "1": "Bachelor's Degree",
+      "2": "Master's Degree",
+      "3": "PhD"
+    }
+  },
+
+  "loan": {
+    "endpoint": "POST /loan/predict",
+    "description": "Predict if a loan application should be approved",
+
+    "sample_request": {
+      "credit_score": 720,
+      "annual_income": 75000,
+      "loan_amount": 25000,
+      "loan_term_months": 36,
+      "employment_years": 4,
+      "existing_debt": 8000,
+      "num_credit_lines": 3,
+      "gender": null,
+      "religion": null,
+      "ethnicity": "hispanic",
+      "age_group": "26-40"
+    },
+
+    "sample_response_approved": {
+      "prediction": 1,
+      "prediction_label": "Approved",
+      "confidence": 0.91,
+      "explanation": "Loan approved — good credit score (720), manageable debt-to-income ratio (11%), 4 years of stable employment.",
+      "fairness": {
+        "sensitive_attribute": "ethnicity",
+        "domain": "loan",
+        "is_fair": true,
+        "warning": null,
+        "metrics": {
+          "note": "Single-prediction fairness is logged."
+        },
+        "ethical_note": "Sensitive attributes are used ONLY to monitor fairness."
+      },
+      "message": "Prediction complete."
+    },
+
+    "sample_response_rejected": {
+      "prediction": 0,
+      "prediction_label": "Rejected",
+      "confidence": 0.15,
+      "explanation": "Loan rejected — low credit score (480, minimum 600 recommended); high debt-to-income ratio (72%).",
+      "fairness": {
+        "sensitive_attribute": "ethnicity",
+        "domain": "loan",
+        "is_fair": true,
+        "warning": null,
+        "metrics": {
+          "note": "Single-prediction fairness is logged."
+        },
+        "ethical_note": "Sensitive attributes are used ONLY to monitor fairness."
+      },
+      "message": "Prediction complete."
+    }
+  },
+
+  "social": {
+    "endpoint": "POST /social/recommend",
+    "description": "Recommend a content category based on user behavior",
+
+    "sample_request": {
+      "avg_session_minutes": 45,
+      "posts_per_day": 3,
+      "topics_interacted": 12,
+      "like_rate": 0.65,
+      "share_rate": 0.2,
+      "comment_rate": 0.1,
+      "account_age_days": 365,
+      "gender": null,
+      "age_group": "25-34",
+      "location": "India",
+      "language": "en"
+    },
+
+    "sample_response": {
+      "recommended_category_id": 0,
+      "recommended_category": "Technology & Science",
+      "confidence": 0.78,
+      "explanation": "Recommended 'Technology & Science' based on your engagement patterns, primarily driven by high content engagement (like_rate: 0.65). This recommendation is based on behavior only, not personal attributes.",
+      "fairness": {
+        "sensitive_attribute": "age_group",
+        "domain": "social",
+        "is_fair": true,
+        "warning": null,
+        "metrics": {
+          "note": "Single-prediction fairness is logged."
+        },
+        "ethical_note": "Sensitive attributes are used ONLY to monitor fairness."
+      },
+      "message": "Recommendation complete."
+    },
+
+    "content_categories": {
+      "0": "Technology & Science",
+      "1": "Entertainment & Pop Culture",
+      "2": "Sports & Fitness",
+      "3": "News & Politics",
+      "4": "Arts & Creativity",
+      "5": "Education & Learning",
+      "6": "Business & Finance",
+      "7": "Lifestyle & Wellness"
+    }
+  },
+
+  "react_axios_example": {
+    "_comment": "Paste this into your React component",
+    "code": "const response = await axios.post('https://quantum-ai-backend.onrender.com/hiring/predict', formData); const { prediction_label, explanation, fairness } = response.data;"
+  },
+
+  "error_responses": {
+    "validation_error_422": {
+      "detail": [
+        {
+          "loc": ["body", "credit_score"],
+          "msg": "Input should be greater than or equal to 300",
+          "type": "greater_than_equal"
+        }
+      ]
+    },
+    "model_not_found_503": {
+      "error": "hiring_model.pkl not found at 'models/hiring_model.pkl'. Please place the model file in the /models directory."
+    },
+    "server_error_500": {
+      "error": "Internal server error",
+      "detail": "Description of what went wrong"
+    }
+  }
+}
