@@ -1,20 +1,25 @@
 """
 loan/predictor.py
 
-Prediction logic for Banking & Loan Approval domain.
+Prediction logic for the Banking & Loan Approval domain.
 
-Model features (no sensitive attributes):
-- credit_score      : 300–850
-- annual_income     : in USD
-- loan_amount       : requested amount in USD
-- loan_term_months  : repayment period (12, 24, 36, 60, etc.)
-- employment_years  : years at current employer
-- existing_debt     : current outstanding debt in USD
-- num_credit_lines  : number of open credit accounts
+predict() returns a structured dict:
+{
+    "prediction":      int,    # 1 = Approved, 0 = Rejected
+    "confidence":      float,
+    "shap_values":     dict,   # {feature_name: float}
+    "shap_available":  bool,
+    "explanation":     str,
+    "bias_risk":       dict,   # from compute_bias_risk_score()
+}
 """
 
-import numpy as np
+from __future__ import annotations
+
 import logging
+from typing import Any, Dict, Optional
+
+from fairness.checker import compute_bias_risk_score
 
 logger = logging.getLogger("loan.predictor")
 
@@ -28,25 +33,64 @@ FEATURE_NAMES = [
     "num_credit_lines",
 ]
 
-# Derived ratio for explainability
-def _debt_to_income(existing_debt, annual_income):
-    if annual_income == 0:
-        return 999
-    return round(existing_debt / annual_income, 3)
 
+# ─── Main entry point ─────────────────────────────────────────────────────────
 
-def _loan_to_income(loan_amount, annual_income):
-    if annual_income == 0:
-        return 999
-    return round(loan_amount / annual_income, 3)
-
-
-def predict(model, features: dict) -> tuple[int, float, str]:
+def predict(
+    model,
+    features: Dict[str, Any],
+    sensitive_attr: Optional[str] = None,
+    domain: str = "loan",
+) -> dict:
     """
-    Returns (prediction, confidence, explanation).
-    prediction: 1 = Approved, 0 = Rejected
+    Run loan-approval prediction and return a fully structured result dict.
+
+    Parameters
+    ----------
+    model          : Loaded sklearn model/pipeline from the registry.
+    features       : Validated financial features — no sensitive attributes.
+    sensitive_attr : Sensitive attribute name for bias-risk weighting only.
+    domain         : Domain label forwarded to bias-risk computation.
     """
-    input_row = [[
+    input_row = _build_input_row(features)
+
+    # ── Prediction ────────────────────────────────────────────────────────────
+    prediction = int(model.predict(input_row)[0])
+
+    # ── Confidence ────────────────────────────────────────────────────────────
+    confidence = 0.5
+    if hasattr(model, "predict_proba"):
+        proba      = model.predict_proba(input_row)[0]
+        confidence = round(float(proba[1]), 4)
+
+    # ── SHAP values ───────────────────────────────────────────────────────────
+    shap_values, shap_available = _compute_shap(model, input_row, prediction)
+
+    # ── Bias risk ─────────────────────────────────────────────────────────────
+    bias_risk = compute_bias_risk_score(
+        confidence=confidence,
+        shap_values=shap_values,
+        sensitive_attr=sensitive_attr,
+        domain=domain,
+    )
+
+    # ── Explanation ───────────────────────────────────────────────────────────
+    explanation = _explain(features, prediction, shap_values, shap_available)
+
+    return {
+        "prediction":     prediction,
+        "confidence":     confidence,
+        "shap_values":    shap_values,
+        "shap_available": shap_available,
+        "explanation":    explanation,
+        "bias_risk":      bias_risk,
+    }
+
+
+# ─── Internals ────────────────────────────────────────────────────────────────
+
+def _build_input_row(features: dict) -> list:
+    return [[
         features["credit_score"],
         features["annual_income"],
         features["loan_amount"],
@@ -56,81 +100,81 @@ def predict(model, features: dict) -> tuple[int, float, str]:
         features["num_credit_lines"],
     ]]
 
-    prediction = int(model.predict(input_row)[0])
 
-    confidence = 0.5
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(input_row)[0]
-        confidence = round(float(proba[1]), 3)
-
-    explanation = _explain(model, features, prediction, input_row)
-    return prediction, confidence, explanation
-
-
-def _explain(model, features: dict, prediction: int, input_row: list) -> str:
+def _compute_shap(
+    model,
+    input_row: list,
+    prediction: int,
+) -> tuple[Dict[str, float], bool]:
     try:
         import shap
-        base_model = model
-        if hasattr(model, "steps"):
-            base_model = model.steps[-1][1]
 
-        explainer = shap.TreeExplainer(base_model)
-        shap_values = explainer.shap_values(input_row)
+        base_model = model.steps[-1][1] if hasattr(model, "steps") else model
+        explainer  = shap.TreeExplainer(base_model)
+        raw        = explainer.shap_values(input_row)
 
-        if isinstance(shap_values, list):
-            values = shap_values[prediction]
-        else:
-            values = shap_values[0]
+        values = raw[prediction] if isinstance(raw, list) else raw
+        flat   = values[0] if hasattr(values[0], "__iter__") else values
 
-        shap_pairs = sorted(
-            zip(FEATURE_NAMES, values[0] if hasattr(values[0], "__iter__") else values),
-            key=lambda x: abs(x[1]),
-            reverse=True,
-        )
+        shap_dict = {
+            feat: round(float(val), 6)
+            for feat, val in zip(FEATURE_NAMES, flat)
+        }
+        return shap_dict, True
 
-        top_feature, top_value = shap_pairs[0]
-        pretty = top_feature.replace("_", " ")
-        direction = "high" if top_value > 0 else "low"
+    except Exception as exc:
+        logger.debug(f"SHAP unavailable: {exc}")
+        return {}, False
 
-        if prediction == 1:
-            return f"Loan approved — primarily driven by {direction} {pretty} ({features.get(top_feature)})."
-        else:
-            return f"Loan rejected — primarily due to {direction} {pretty} ({features.get(top_feature)})."
 
-    except Exception as e:
-        logger.debug(f"SHAP unavailable ({e}). Using rule-based explanation.")
-        return _rule_based_explanation(features, prediction)
+def _explain(
+    features: dict,
+    prediction: int,
+    shap_values: Dict[str, float],
+    shap_available: bool,
+) -> str:
+    if shap_available and shap_values:
+        return _shap_explanation(features, prediction, shap_values)
+    return _rule_based_explanation(features, prediction)
+
+
+def _shap_explanation(
+    features: dict,
+    prediction: int,
+    shap_values: Dict[str, float],
+) -> str:
+    top_feat, top_val = max(shap_values.items(), key=lambda kv: abs(kv[1]))
+    direction  = "high" if top_val > 0 else "low"
+    pretty     = top_feat.replace("_", " ")
+    feat_value = features.get(top_feat, "N/A")
+
+    if prediction == 1:
+        return f"Loan approved — primarily driven by {direction} {pretty} ({feat_value})."
+    return f"Loan rejected — primarily due to {direction} {pretty} ({feat_value})."
 
 
 def _rule_based_explanation(features: dict, prediction: int) -> str:
     credit    = features.get("credit_score", 0)
-    income    = features.get("annual_income", 1)
+    income    = features.get("annual_income", 1) or 1
     debt      = features.get("existing_debt", 0)
     loan_amt  = features.get("loan_amount", 0)
     emp_years = features.get("employment_years", 0)
 
-    dti   = _debt_to_income(debt, income)
-    lti   = _loan_to_income(loan_amt, income)
+    dti = round(debt / income, 3)
+    lti = round(loan_amt / income, 3)
 
     if prediction == 1:
         factors = []
-        if credit >= 700:
-            factors.append(f"good credit score ({credit})")
-        if dti < 0.4:
-            factors.append(f"manageable debt-to-income ratio ({dti:.0%})")
-        if emp_years >= 2:
-            factors.append(f"{emp_years} years of stable employment")
-        reason = ", ".join(factors) if factors else "meets all lending criteria"
+        if credit    >= 700: factors.append(f"good credit score ({credit})")
+        if dti        < 0.4: factors.append(f"manageable debt-to-income ratio ({dti:.0%})")
+        if emp_years  >= 2:  factors.append(f"{emp_years} years of stable employment")
+        reason = ", ".join(factors) or "meets all lending criteria"
         return f"Loan approved — {reason}."
-    else:
-        issues = []
-        if credit < 600:
-            issues.append(f"low credit score ({credit}, minimum 600 recommended)")
-        if dti > 0.5:
-            issues.append(f"high debt-to-income ratio ({dti:.0%})")
-        if lti > 3:
-            issues.append(f"loan amount too high relative to income (ratio: {lti:.1f}x)")
-        if emp_years < 1:
-            issues.append("less than 1 year of employment history")
-        reason = "; ".join(issues) if issues else "does not meet lending criteria"
-        return f"Loan rejected — {reason}."
+
+    issues = []
+    if credit    < 600: issues.append(f"low credit score ({credit}, minimum 600 recommended)")
+    if dti       > 0.5: issues.append(f"high debt-to-income ratio ({dti:.0%})")
+    if lti       > 3:   issues.append(f"loan amount too high relative to income ({lti:.1f}x income)")
+    if emp_years  < 1:  issues.append("less than 1 year of employment history")
+    reason = "; ".join(issues) or "does not meet lending criteria"
+    return f"Loan rejected — {reason}."

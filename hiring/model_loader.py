@@ -1,51 +1,74 @@
 """
 hiring/model_loader.py
 
-Loads the hiring_model.pkl file exactly once when the app starts.
-Uses joblib for fast deserialization of scikit-learn models.
+Thin adapter that delegates all model-lifecycle work to the shared
+ModelRegistry singleton.  Business code should always call get_model()
+or get_model_ab() instead of touching joblib directly.
 
-Why load once?  Loading a .pkl file on every request is slow.
-We cache it in memory using a module-level variable.
+Hot-swap without a server restart::
+
+    from hiring.model_loader import hot_swap
+    from pathlib import Path
+    hot_swap(Path("models/hiring_model_v2.pkl"))
+
+A/B fairness test (10 % of traffic to a challenger)::
+
+    from utils.model_registry import registry
+    from pathlib import Path
+    registry.register_ab_variant(
+        "hiring", "challenger",
+        Path("models/hiring_model_v2.pkl"),
+        traffic_fraction=0.10,
+    )
 """
 
-import os
-import joblib
-import logging
 from pathlib import Path
+from typing import Any, Tuple
 
-logger = logging.getLogger("hiring.model_loader")
+from utils.model_registry import registry
 
-# Path to the model file (relative to project root)
+MODEL_NAME = "hiring"
 MODEL_PATH = Path("models/hiring_model.pkl")
 
-# Module-level cache — loaded once, reused on every request
-_model = None
 
-
-def load_model():
+def preload(path: Path = MODEL_PATH) -> None:
     """
-    Loads the hiring model from disk into memory.
-    Returns the model object (e.g. sklearn Pipeline or Classifier).
-    Raises FileNotFoundError if the .pkl file is missing.
+    Load the hiring model into memory.
+    Called once at application startup via main.py lifespan hook.
     """
-    global _model
-
-    if _model is not None:
-        return _model  # Already loaded — return cached version
-
-    if not MODEL_PATH.exists():
-        logger.error(f"Model file not found: {MODEL_PATH}")
-        raise FileNotFoundError(
-            f"hiring_model.pkl not found at '{MODEL_PATH}'. "
-            "Please place the model file in the /models directory."
-        )
-
-    logger.info(f"Loading hiring model from {MODEL_PATH} …")
-    _model = joblib.load(MODEL_PATH)
-    logger.info("Hiring model loaded successfully.")
-    return _model
+    registry.load(MODEL_NAME, path)
 
 
-def get_model():
-    """Convenience function — returns cached model or loads it."""
-    return load_model()
+def get_model(variant: str = "primary") -> Any:
+    """
+    Return the cached hiring model for *variant* (default: "primary").
+    Raises KeyError if preload() has not been called yet.
+    """
+    return registry.get(MODEL_NAME, variant)
+
+
+def get_model_ab() -> Tuple[Any, str]:
+    """
+    Return *(model, variant_name)* respecting any active A/B traffic split.
+    Falls back to ("primary model", "primary") when no split is configured.
+    """
+    return registry.get_ab(MODEL_NAME)
+
+
+def get_version(variant: str = "primary") -> str:
+    """12-character version hex for the given variant (for audit logging)."""
+    return registry.get_version(MODEL_NAME, variant)
+
+
+def get_metadata(variant: str = "primary") -> dict:
+    """Full provenance dict — embedded in the correlation audit log."""
+    return registry.get_metadata(MODEL_NAME, variant)
+
+
+def hot_swap(new_path: Path = MODEL_PATH, variant: str = "primary"):
+    """
+    Atomically reload the hiring model from *new_path* at runtime.
+    No server restart required.  Safe to call while the server is handling
+    live traffic — in-flight requests finish on the old model.
+    """
+    return registry.hot_swap(MODEL_NAME, new_path, variant)
