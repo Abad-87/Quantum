@@ -1,60 +1,20 @@
 """
-loan/router.py  —  Phase 3: async SHAP
+loan/router.py  —  Phase 4: security & privacy
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel, Field, field_validator
-from typing import Any, Dict, Optional
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 import logging
 
 from .model_loader import get_model_ab, get_metadata
-from .predictor import predict
-from fairness.checker import run_fairness_check, run_post_processing_checks
-from utils.logger import log_prediction, log_correlation_event
-from utils.database import save_prediction, preprocess_features, get_recent_predictions
-from utils.shap_cache import compute_shap_background
+from .predictor    import predict
+from fairness.checker  import run_fairness_check, run_post_processing_checks
+from utils.logger      import log_prediction, log_correlation_event
+from utils.database    import save_prediction, preprocess_features, get_recent_predictions
+from utils.shap_cache  import compute_shap_background
+from utils.validation  import LoanRequest, LoanResponse   # ← Phase 4
 
 router = APIRouter()
 logger = logging.getLogger("loan.router")
-
-
-class LoanRequest(BaseModel):
-    credit_score:      int   = Field(..., ge=300,  le=850)
-    annual_income:     float = Field(..., ge=0)
-    loan_amount:       float = Field(..., ge=100)
-    loan_term_months:  int   = Field(..., ge=6,    le=360)
-    employment_years:  float = Field(..., ge=0,    le=50)
-    existing_debt:     float = Field(0.0, ge=0)
-    num_credit_lines:  int   = Field(0,   ge=0,   le=50)
-    gender:    Optional[str] = Field(None)
-    religion:  Optional[str] = Field(None)
-    ethnicity: Optional[str] = Field(None)
-    age_group: Optional[str] = Field(None)
-
-    @field_validator("loan_amount")
-    @classmethod
-    def loan_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError("loan_amount must be greater than 0")
-        return v
-
-
-class LoanResponse(BaseModel):
-    prediction:       int
-    prediction_label: str
-    confidence:       float
-    shap_values:      Dict[str, float]
-    shap_available:   bool
-    shap_status:      str
-    shap_poll_url:    str
-    explanation:      str
-    bias_risk:        Dict[str, Any]
-    fairness:         Dict[str, Any]
-    preprocessing:    Dict[str, Any]
-    model_version:    str
-    model_variant:    str
-    correlation_id:   str
-    message:          str
 
 
 async def _run_post_processing_background(domain: str, sensitive_attr: str) -> None:
@@ -80,7 +40,11 @@ async def _run_post_processing_background(domain: str, sensitive_attr: str) -> N
         logger.error(f"[{domain}] post-processing background failed: {exc}")
 
 
-@router.post("/predict", response_model=LoanResponse)
+@router.post(
+    "/predict",
+    response_model = LoanResponse,
+    summary        = "Loan Approval Prediction",
+)
 async def loan_predict(
     request:          Request,
     body:             LoanRequest,
@@ -89,8 +53,11 @@ async def loan_predict(
     """
     **Loan Approval Prediction**
 
-    Returns immediately. Full SHAP explanation computed asynchronously.
-    Poll: **GET** `/shap/{correlation_id}` or listen on **WS** `/shap/ws/{correlation_id}`.
+    Evaluates a loan application from financial features only.
+    All input validated and injection-guarded.  Sensitive attributes used
+    ONLY for fairness auditing.
+
+    Returns immediately; SHAP explanation available at GET /shap/{correlation_id}.
     """
     correlation_id: str = getattr(request.state, "correlation_id", "unknown")
 
@@ -120,7 +87,7 @@ async def loan_predict(
         result = predict(model, prediction_features, sensitive_attr=sensitive_attr, domain="loan")
     except Exception as exc:
         logger.error(f"[{correlation_id}] Loan prediction error: {exc}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
+        raise HTTPException(status_code=500, detail="Prediction failed. Please retry.")
 
     prediction_label = "Approved" if result["prediction"] == 1 else "Rejected"
 
@@ -168,14 +135,12 @@ async def loan_predict(
             "shap_status": "pending",
         },
     )
-
     background_tasks.add_task(
         compute_shap_background,
         model, result["input_row"], result["prediction"],
         result["feature_names"], correlation_id, "loan",
         prediction_features, sensitive_attr,
     )
-
     if sensitive_attr:
         background_tasks.add_task(_run_post_processing_background, "loan", sensitive_attr)
 

@@ -1,67 +1,30 @@
 """
-hiring/router.py  —  Phase 3: async SHAP
+hiring/router.py  —  Phase 4: security & privacy
 
-Phase 3 changes
+Phase 4 changes
 ---------------
-• predict() no longer blocks on SHAP — returns immediately with rule-based
-  explanation and shap_status: "pending".
-• compute_shap_background() is added as a BackgroundTask so the event loop
-  is never blocked by the TreeExplainer CPU work.
-• Response now includes shap_status ("pending") and a shap_poll_url hint
-  so clients know where to retrieve the full explanation.
+• HiringRequest / HiringResponse imported from utils.validation — schemas
+  now enforce: education_level allowlist, score precision rounding, cross-
+  field data-quality check, sensitive-attr injection guard, max-length,
+  pattern allowlist, and extra="forbid" (no unknown fields accepted).
+• All log calls go through the PII-masking logger (utils/logger.py).
+• 422 validation errors are formatted by the custom handler in main.py
+  (ValidationErrorResponse) so no internal detail leaks to the client.
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel, Field, field_validator
-from typing import Any, Dict, Optional
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 import logging
 
 from .model_loader import get_model_ab, get_metadata
-from .predictor import predict
-from fairness.checker import run_fairness_check, run_post_processing_checks
-from utils.logger import log_prediction, log_correlation_event
-from utils.database import save_prediction, preprocess_features, get_recent_predictions
-from utils.shap_cache import compute_shap_background
+from .predictor    import predict
+from fairness.checker  import run_fairness_check, run_post_processing_checks
+from utils.logger      import log_prediction, log_correlation_event
+from utils.database    import save_prediction, preprocess_features, get_recent_predictions
+from utils.shap_cache  import compute_shap_background
+from utils.validation  import HiringRequest, HiringResponse   # ← Phase 4
 
 router = APIRouter()
 logger = logging.getLogger("hiring.router")
-
-
-class HiringRequest(BaseModel):
-    years_experience:    float = Field(..., ge=0,   le=50)
-    education_level:     int   = Field(..., ge=0,   le=3)
-    technical_score:     float = Field(..., ge=0,   le=100)
-    communication_score: float = Field(..., ge=0,   le=100)
-    num_past_jobs:       int   = Field(..., ge=0,   le=30)
-    certifications:      int   = Field(0,   ge=0,   le=20)
-    gender:    Optional[str]   = Field(None)
-    religion:  Optional[str]   = Field(None)
-    ethnicity: Optional[str]   = Field(None)
-
-    @field_validator("education_level")
-    @classmethod
-    def validate_education(cls, v):
-        if v not in {0, 1, 2, 3}:
-            raise ValueError("education_level must be 0, 1, 2, or 3")
-        return v
-
-
-class HiringResponse(BaseModel):
-    prediction:        int
-    prediction_label:  str
-    confidence:        float
-    shap_values:       Dict[str, float]   # {} on first response
-    shap_available:    bool               # False on first response
-    shap_status:       str                # "pending" | "ready" | "error"
-    shap_poll_url:     str                # GET /shap/{correlation_id}
-    explanation:       str                # rule-based (instant)
-    bias_risk:         Dict[str, Any]
-    fairness:          Dict[str, Any]
-    preprocessing:     Dict[str, Any]
-    model_version:     str
-    model_variant:     str
-    correlation_id:    str
-    message:           str
 
 
 async def _run_post_processing_background(domain: str, sensitive_attr: str) -> None:
@@ -87,7 +50,12 @@ async def _run_post_processing_background(domain: str, sensitive_attr: str) -> N
         logger.error(f"[{domain}] post-processing background failed: {exc}")
 
 
-@router.post("/predict", response_model=HiringResponse)
+@router.post(
+    "/predict",
+    response_model   = HiringResponse,
+    summary          = "Job Hiring Prediction",
+    response_description = "Decision returned immediately; SHAP explanation computed asynchronously.",
+)
 async def hiring_predict(
     request:          Request,
     body:             HiringRequest,
@@ -96,8 +64,10 @@ async def hiring_predict(
     """
     **Job Hiring Prediction**
 
-    Returns the decision immediately.  Full SHAP explanation is computed
-    asynchronously and available within seconds at:
+    Predicts whether a candidate should be hired from objective features.
+    All input is validated and injection-guarded before processing.
+
+    Returns the decision immediately.  Full SHAP explanation available at:
     - **GET** `/shap/{correlation_id}` — REST poll
     - **WS**  `/shap/ws/{correlation_id}` — WebSocket push
     """
@@ -120,19 +90,17 @@ async def hiring_predict(
         ("gender", body.gender), ("religion", body.religion), ("ethnicity", body.ethnicity),
     ])
 
-    # ── Phase 2: pre-processing ───────────────────────────────────────────────
     preprocessing_report = await preprocess_features(
         features=raw_features, sensitive_attr=sensitive_attr,
         sensitive_value=sensitive_value, domain="hiring",
     )
     prediction_features = preprocessing_report["features"]
 
-    # ── Phase 3: fast predict (no SHAP) ──────────────────────────────────────
     try:
         result = predict(model, prediction_features, sensitive_attr=sensitive_attr, domain="hiring")
     except Exception as exc:
         logger.error(f"[{correlation_id}] Prediction error: {exc}")
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}")
+        raise HTTPException(status_code=500, detail="Prediction failed. Please retry.")
 
     prediction_label = "Hired" if result["prediction"] == 1 else "Not Hired"
 
@@ -162,7 +130,7 @@ async def hiring_predict(
     }
 
     background_tasks.add_task(log_prediction,
-        domain=  "hiring", input_data=prediction_features,
+        domain="hiring", input_data=prediction_features,
         prediction=result["prediction"], prediction_label=prediction_label,
         explanation=result["explanation"], fairness_result=fairness_result,
         correlation_id=correlation_id,
@@ -180,15 +148,12 @@ async def hiring_predict(
             "shap_status": "pending",
         },
     )
-
-    # ── Phase 3: schedule async SHAP computation ──────────────────────────────
     background_tasks.add_task(
         compute_shap_background,
         model, result["input_row"], result["prediction"],
         result["feature_names"], correlation_id, "hiring",
         prediction_features, sensitive_attr,
     )
-
     if sensitive_attr:
         background_tasks.add_task(_run_post_processing_background, "hiring", sensitive_attr)
 

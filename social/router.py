@@ -1,60 +1,20 @@
 """
-social/router.py  —  Phase 3: async SHAP
+social/router.py  —  Phase 4: security & privacy
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Request
-from pydantic import BaseModel, Field, field_validator
-from typing import Any, Dict, Optional
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 import logging
 
 from .model_loader import get_model_ab, get_metadata
-from .predictor import predict
-from fairness.checker import run_fairness_check, run_post_processing_checks
-from utils.logger import log_prediction, log_correlation_event
-from utils.database import save_prediction, preprocess_features, get_recent_predictions
-from utils.shap_cache import compute_shap_background
+from .predictor    import predict
+from fairness.checker  import run_fairness_check, run_post_processing_checks
+from utils.logger      import log_prediction, log_correlation_event
+from utils.database    import save_prediction, preprocess_features, get_recent_predictions
+from utils.shap_cache  import compute_shap_background
+from utils.validation  import SocialRequest, SocialResponse   # ← Phase 4
 
 router = APIRouter()
 logger = logging.getLogger("social.router")
-
-
-class SocialRequest(BaseModel):
-    avg_session_minutes: float = Field(..., ge=0,   le=1440)
-    posts_per_day:       float = Field(0.0, ge=0,   le=100)
-    topics_interacted:   int   = Field(..., ge=0,   le=50)
-    like_rate:           float = Field(..., ge=0.0, le=1.0)
-    share_rate:          float = Field(0.0, ge=0.0, le=1.0)
-    comment_rate:        float = Field(0.0, ge=0.0, le=1.0)
-    account_age_days:    int   = Field(..., ge=0,   le=10000)
-    gender:    Optional[str]   = Field(None)
-    age_group: Optional[str]   = Field(None)
-    location:  Optional[str]   = Field(None)
-    language:  Optional[str]   = Field(None)
-
-    @field_validator("like_rate", "share_rate", "comment_rate")
-    @classmethod
-    def rate_in_range(cls, v):
-        if not 0.0 <= v <= 1.0:
-            raise ValueError("Rate values must be between 0.0 and 1.0")
-        return v
-
-
-class SocialResponse(BaseModel):
-    recommended_category_id: int
-    recommended_category:    str
-    confidence:              float
-    shap_values:             Dict[str, float]
-    shap_available:          bool
-    shap_status:             str
-    shap_poll_url:           str
-    explanation:             str
-    bias_risk:               Dict[str, Any]
-    fairness:                Dict[str, Any]
-    preprocessing:           Dict[str, Any]
-    model_version:           str
-    model_variant:           str
-    correlation_id:          str
-    message:                 str
 
 
 async def _run_post_processing_background(domain: str, sensitive_attr: str) -> None:
@@ -80,7 +40,11 @@ async def _run_post_processing_background(domain: str, sensitive_attr: str) -> N
         logger.error(f"[{domain}] post-processing background failed: {exc}")
 
 
-@router.post("/recommend", response_model=SocialResponse)
+@router.post(
+    "/recommend",
+    response_model = SocialResponse,
+    summary        = "Social Media Content Recommendation",
+)
 async def social_recommend(
     request:          Request,
     body:             SocialRequest,
@@ -89,8 +53,11 @@ async def social_recommend(
     """
     **Social Media Content Recommendation**
 
-    Returns immediately. Full SHAP explanation computed asynchronously.
-    Poll: **GET** `/shap/{correlation_id}` or listen on **WS** `/shap/ws/{correlation_id}`.
+    Recommends a content category from behavioural signals only.
+    All input validated and injection-guarded.  Demographic attributes used
+    ONLY for fairness auditing — never to drive the recommendation.
+
+    Returns immediately; SHAP explanation available at GET /shap/{correlation_id}.
     """
     correlation_id: str = getattr(request.state, "correlation_id", "unknown")
 
@@ -120,7 +87,7 @@ async def social_recommend(
         result = predict(model, prediction_features, sensitive_attr=sensitive_attr, domain="social")
     except Exception as exc:
         logger.error(f"[{correlation_id}] Social prediction error: {exc}")
-        raise HTTPException(status_code=500, detail=f"Recommendation failed: {exc}")
+        raise HTTPException(status_code=500, detail="Recommendation failed. Please retry.")
 
     fairness_result = run_fairness_check(
         prediction=result["prediction"],
@@ -166,14 +133,12 @@ async def social_recommend(
             "shap_status": "pending",
         },
     )
-
     background_tasks.add_task(
         compute_shap_background,
         model, result["input_row"], result["prediction"],
         result["feature_names"], correlation_id, "social",
         prediction_features, sensitive_attr,
     )
-
     if sensitive_attr:
         background_tasks.add_task(_run_post_processing_background, "social", sensitive_attr)
 
