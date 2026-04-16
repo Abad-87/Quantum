@@ -1,18 +1,7 @@
 """
-social/predictor.py
+social/predictor.py  —  Phase 3: async SHAP
 
-Prediction logic for the Social Media Recommendation domain.
-
-predict() returns a structured dict:
-{
-    "prediction":           int,    # category ID (0–7)
-    "category_label":       str,    # human-readable category name
-    "confidence":           float,
-    "shap_values":          dict,   # {feature_name: float}
-    "shap_available":       bool,
-    "explanation":          str,
-    "bias_risk":            dict,   # from compute_bias_risk_score()
-}
+Critical-path changes: SHAP removed.  See hiring/predictor.py for full notes.
 """
 
 from __future__ import annotations
@@ -48,64 +37,44 @@ CONTENT_CATEGORIES: Dict[int, str] = {
 }
 
 
-# ─── Main entry point ─────────────────────────────────────────────────────────
-
 def predict(
     model,
-    features: Dict[str, Any],
+    features:       Dict[str, Any],
     sensitive_attr: Optional[str] = None,
-    domain: str = "social",
+    domain:         str = "social",
 ) -> dict:
-    """
-    Run content-category recommendation and return a fully structured result dict.
-
-    Parameters
-    ----------
-    model          : Loaded sklearn model/pipeline from the registry.
-    features       : Validated behavioural features — no sensitive attributes.
-    sensitive_attr : Sensitive attribute name for bias-risk weighting only.
-    domain         : Domain label forwarded to bias-risk computation.
-    """
-    input_row = _build_input_row(features)
-
-    # ── Prediction ────────────────────────────────────────────────────────────
+    """Fast synchronous prediction — SHAP computed asynchronously."""
+    input_row      = _build_input_row(features)
     category_id    = int(model.predict(input_row)[0])
     category_label = CONTENT_CATEGORIES.get(category_id, f"Category {category_id}")
 
-    # ── Confidence (max class probability) ───────────────────────────────────
     confidence = 0.5
     if hasattr(model, "predict_proba"):
         proba      = model.predict_proba(input_row)[0]
         confidence = round(float(np.max(proba)), 4)
 
-    # ── SHAP values ───────────────────────────────────────────────────────────
-    shap_values, shap_available = _compute_shap(model, input_row, category_id)
-
-    # ── Bias risk ─────────────────────────────────────────────────────────────
     bias_risk = compute_bias_risk_score(
-        confidence=confidence,
-        shap_values=shap_values,
-        sensitive_attr=sensitive_attr,
-        domain=domain,
+        confidence     = confidence,
+        shap_values    = None,
+        sensitive_attr = sensitive_attr,
+        domain         = domain,
     )
 
-    # ── Explanation ───────────────────────────────────────────────────────────
-    explanation = _explain(
-        features, category_id, category_label, shap_values, shap_available
-    )
+    explanation = _rule_based_explanation(features, category_label)
 
     return {
         "prediction":     category_id,
         "category_label": category_label,
         "confidence":     confidence,
-        "shap_values":    shap_values,
-        "shap_available": shap_available,
+        "shap_values":    {},
+        "shap_available": False,
+        "shap_status":    "pending",
         "explanation":    explanation,
         "bias_risk":      bias_risk,
+        "input_row":      input_row,
+        "feature_names":  FEATURE_NAMES,
     }
 
-
-# ─── Internals ────────────────────────────────────────────────────────────────
 
 def _build_input_row(features: dict) -> list:
     return [[
@@ -117,67 +86,6 @@ def _build_input_row(features: dict) -> list:
         features["comment_rate"],
         features["account_age_days"],
     ]]
-
-
-def _compute_shap(
-    model,
-    input_row: list,
-    category_id: int,
-) -> tuple[Dict[str, float], bool]:
-    """
-    For multiclass models, extract SHAP values for the predicted class only,
-    so the returned dict is always {feature: scalar} — no nested arrays.
-    """
-    try:
-        import shap
-
-        base_model = model.steps[-1][1] if hasattr(model, "steps") else model
-        explainer  = shap.TreeExplainer(base_model)
-        raw        = explainer.shap_values(input_row)
-
-        # Multiclass: raw is List[n_classes × n_samples × n_features]
-        if isinstance(raw, list) and len(raw) > category_id:
-            flat = raw[category_id][0]
-        elif isinstance(raw, np.ndarray):
-            flat = raw[0]
-        else:
-            raise ValueError(f"Unexpected SHAP output type: {type(raw)}")
-
-        shap_dict = {
-            feat: round(float(val), 6)
-            for feat, val in zip(FEATURE_NAMES, flat)
-        }
-        return shap_dict, True
-
-    except Exception as exc:
-        logger.debug(f"SHAP unavailable: {exc}")
-        return {}, False
-
-
-def _explain(
-    features: dict,
-    category_id: int,
-    category_label: str,
-    shap_values: Dict[str, float],
-    shap_available: bool,
-) -> str:
-    if shap_available and shap_values:
-        return _shap_explanation(features, category_label, shap_values)
-    return _rule_based_explanation(features, category_label)
-
-
-def _shap_explanation(
-    features: dict,
-    category_label: str,
-    shap_values: Dict[str, float],
-) -> str:
-    top_feat, _ = max(shap_values.items(), key=lambda kv: abs(kv[1]))
-    pretty      = top_feat.replace("_", " ")
-    feat_value  = features.get(top_feat, "N/A")
-    return (
-        f"Recommended '{category_label}' based on your engagement patterns, "
-        f"primarily driven by {pretty} ({feat_value})."
-    )
 
 
 def _rule_based_explanation(features: dict, category_label: str) -> str:
@@ -195,5 +103,5 @@ def _rule_based_explanation(features: dict, category_label: str) -> str:
     signals_str = ", ".join(signals) or "your recent activity patterns"
     return (
         f"Recommended '{category_label}' based on {signals_str}. "
-        "This recommendation is based on behaviour only, not personal attributes."
+        "(Full SHAP explanation pending)"
     )
