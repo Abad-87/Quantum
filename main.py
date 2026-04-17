@@ -245,6 +245,7 @@ async def correlation_middleware(request: Request, call_next):
 
     correlation_id    = str(uuid.uuid4())
     path              = request.url.path
+    method            = request.method
     domain            = _path_to_domain(path)
     model_meta        = registry.get_metadata(domain) if domain else {}
     sanitised_payload = _sanitise(raw_payload)
@@ -254,7 +255,7 @@ async def correlation_middleware(request: Request, call_next):
             correlation_id = correlation_id,
             event          = "request_received",
             path           = path,
-            method         = request.method,
+            method         = method,
             payload        = sanitised_payload,
             model_metadata = model_meta,
             result         = None,
